@@ -26,17 +26,17 @@ jobs:
       DEPLOY_SHA: ${{ github.sha }}
 
     steps:
-      # ------------------------------------------------------------
+      # ============================================================
       # 1. Checkout
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Checkout deployment commit
         uses: actions/checkout@v4
         with:
           ref: ${{ env.DEPLOY_SHA }}
 
-      # ------------------------------------------------------------
-      # 2. Authenticate GitHub -> Google Cloud with OIDC/WIF
-      # ------------------------------------------------------------
+      # ============================================================
+      # 2. Authenticate GitHub -> Google Cloud using OIDC/WIF
+      # ============================================================
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
@@ -46,55 +46,111 @@ jobs:
 
       - name: Setup Google Cloud CLI
         uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 416.0.0"
 
-      # ------------------------------------------------------------
-      # 3. Download Phase VI release
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. Download and materialize Phase VI release
+      # ============================================================
       - name: Materialize checksummed Phase VI artifacts
+        id: phase6
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p backend/artifacts
+          mkdir -p /tmp/phase6-extracted
 
           echo "Downloading Phase VI release..."
+
           gcloud storage cp \
             "$PHASE6_RELEASE" \
             /tmp/phase6-release.tar.gz
 
+          echo "Archive contents:"
+          tar -tzf /tmp/phase6-release.tar.gz | sed -n '1,100p'
+
           echo "Extracting Phase VI release..."
+
           tar -xzf \
             /tmp/phase6-release.tar.gz \
-            -C backend/artifacts
+            -C /tmp/phase6-extracted
+
+          echo "Extracted files:"
+          find /tmp/phase6-extracted \
+            -maxdepth 4 \
+            -type f \
+            | sort
+
+          PHASE6_ROOT=$(find /tmp/phase6-extracted \
+            -type f \
+            -name "environment_v4_1.json" \
+            -printf '%h\n' \
+            -quit)
+
+          if [ -z "$PHASE6_ROOT" ]; then
+            echo "ERROR: environment_v4_1.json was not found."
+            exit 1
+          fi
+
+          echo "Detected Phase VI artifact root:"
+          echo "$PHASE6_ROOT"
+
+          cp -a "$PHASE6_ROOT"/. backend/artifacts/
 
           echo "Checking required Phase VI files..."
 
-          test -f backend/artifacts/dinov2_logistic_semantic_sky_v3_1.joblib
-          test -f backend/artifacts/region_definitions_v3_1.json
-          test -f backend/artifacts/environment_v4_1.json
-          test -f backend/artifacts/release_manifest_v4_1.json
+          required_files=(
+            "dinov2_logistic_semantic_sky_v3_1.joblib"
+            "region_definitions_v3_1.json"
+            "environment_v4_1.json"
+            "release_manifest_v4_1.json"
+          )
 
-          echo "Reading locked ML dependency versions..."
+          for file in "${required_files[@]}"; do
+            if [ ! -f "backend/artifacts/$file" ]; then
+              echo "ERROR: missing backend/artifacts/$file"
+              exit 1
+            fi
 
-          python - <<'PY' >> "$GITHUB_ENV"
+            echo "OK: backend/artifacts/$file"
+          done
+
+          echo "Reading locked dependency versions..."
+
+          python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           from pathlib import Path
 
-          path = Path("backend/artifacts/environment_v4_1.json")
-          versions = json.loads(path.read_text())
+          versions = json.loads(
+              Path("backend/artifacts/environment_v4_1.json").read_text()
+          )
 
-          print(f"PHASE6_SKLEARN_VERSION={versions['scikit_learn']}")
-          print(f"PHASE6_TIMM_VERSION={versions['timm']}")
-          print(f"PHASE6_TORCH_VERSION={versions['torch'].split('+')[0]}")
+          print(
+              f"sklearn_version="
+              f"{versions['scikit_learn']}"
+          )
+
+          print(
+              f"timm_version="
+              f"{versions['timm']}"
+          )
+
+          print(
+              f"torch_version="
+              f"{versions['torch'].split('+')[0]}"
+          )
           PY
 
-      # ------------------------------------------------------------
-      # 4. Download Phase VII Mask2Former release
-      # ------------------------------------------------------------
+      # ============================================================
+      # 4. Download Mask2Former release
+      # ============================================================
       - name: Materialize checksummed Mask2Former artifacts
         shell: bash
         run: |
           set -euo pipefail
+
+          mkdir -p backend/artifacts
 
           echo "Downloading Mask2Former release..."
 
@@ -110,24 +166,39 @@ jobs:
 
           echo "Checking Mask2Former files..."
 
-          test -f backend/artifacts/mask2former_kitti_best/model.safetensors
-          test -f backend/artifacts/mask2former_kitti_best/config.json
-          test -f backend/artifacts/mask2former_kitti_best/preprocessor_config.json
-          test -f backend/artifacts/mask2former_kitti_best/release_manifest.json
+          required_files=(
+            "model.safetensors"
+            "config.json"
+            "preprocessor_config.json"
+            "release_manifest.json"
+          )
 
-      # ------------------------------------------------------------
+          for file in "${required_files[@]}"; do
+            path="backend/artifacts/mask2former_kitti_best/$file"
+
+            if [ ! -f "$path" ]; then
+              echo "ERROR: missing $path"
+              exit 1
+            fi
+
+            echo "OK: $path"
+          done
+
+      # ============================================================
       # 5. Validate SHA-256 manifests
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Validate deployable artifact checksums
         working-directory: backend
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/validate_release.py --artifacts artifacts
 
-      # ------------------------------------------------------------
-      # 6. Authenticate GitHub -> Azure with OIDC
-      # ------------------------------------------------------------
+          python scripts/validate_release.py \
+            --artifacts artifacts
+
+      # ============================================================
+      # 6. Authenticate GitHub -> Azure using OIDC
+      # ============================================================
       - name: Authenticate to Azure
         uses: azure/login@v3
         with:
@@ -135,17 +206,22 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ------------------------------------------------------------
-      # 7. Verify Azure context
-      # ------------------------------------------------------------
+      # ============================================================
+      # 7. Verify Azure infrastructure
+      # ============================================================
       - name: Verify Azure deployment context
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Resource group: $RESOURCE_GROUP"
-          echo "ACR: $ACR_NAME"
-          echo "Container Apps environment: $CONTAINERAPPS_ENV"
+          echo "Resource group:"
+          echo "$RESOURCE_GROUP"
+
+          echo "Azure Container Registry:"
+          echo "$ACR_NAME"
+
+          echo "Container Apps environment:"
+          echo "$CONTAINERAPPS_ENV"
 
           az group show \
             --name "$RESOURCE_GROUP" \
@@ -161,9 +237,9 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --output none
 
-      # ------------------------------------------------------------
-      # 8. Build + push + deploy FastAPI backend
-      # ------------------------------------------------------------
+      # ============================================================
+      # 8. Build, push and deploy FastAPI backend
+      # ============================================================
       - name: Build and deploy API
         uses: azure/container-apps-deploy-action@v1
         with:
@@ -176,10 +252,11 @@ jobs:
           containerAppEnvironment: ${{ env.CONTAINERAPPS_ENV }}
           resourceGroup: ${{ env.RESOURCE_GROUP }}
 
-          imageToBuild: ${{ env.ACR_NAME }}.azurecr.io/phase7-weather-api:${{ env.DEPLOY_SHA }}
+          imageToBuild: >-
+            ${{ env.ACR_NAME }}.azurecr.io/phase7-weather-api:${{ env.DEPLOY_SHA }}
 
           buildArguments: |
-            "SCIKIT_LEARN_VERSION=${{ env.PHASE6_SKLEARN_VERSION }}" "TIMM_VERSION=${{ env.PHASE6_TIMM_VERSION }}" "TORCH_VERSION=${{ env.PHASE6_TORCH_VERSION }}"
+            "SCIKIT_LEARN_VERSION=${{ steps.phase6.outputs.sklearn_version }}" "TIMM_VERSION=${{ steps.phase6.outputs.timm_version }}" "TORCH_VERSION=${{ steps.phase6.outputs.torch_version }}"
 
           targetPort: 8000
           ingress: external
@@ -193,9 +270,9 @@ jobs:
             SEGMENTATION_ENABLED=true
             SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best
 
-      # ------------------------------------------------------------
-      # 9. Get API public URL
-      # ------------------------------------------------------------
+      # ============================================================
+      # 9. Resolve backend public URL
+      # ============================================================
       - name: Resolve API URL
         id: api
         shell: bash
@@ -208,13 +285,19 @@ jobs:
             --query properties.configuration.ingress.fqdn \
             -o tsv)
 
-          echo "API FQDN: $fqdn"
+          if [ -z "$fqdn" ]; then
+            echo "ERROR: API FQDN could not be resolved."
+            exit 1
+          fi
+
+          echo "API FQDN:"
+          echo "$fqdn"
 
           echo "url=https://$fqdn" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # 10. Smoke-test API
-      # ------------------------------------------------------------
+      # ============================================================
+      # 10. Smoke-test backend
+      # ============================================================
       - name: Smoke-test deployed API
         shell: bash
         run: |
@@ -222,7 +305,8 @@ jobs:
 
           API_URL="${{ steps.api.outputs.url }}"
 
-          echo "Waiting for API: $API_URL"
+          echo "Waiting for API:"
+          echo "$API_URL"
 
           for i in {1..30}; do
             if curl \
@@ -240,43 +324,47 @@ jobs:
             sleep 10
           done
 
-          echo "API did not become ready."
+          echo "ERROR: API did not become alive."
           exit 1
 
-      # ------------------------------------------------------------
-      # 11. Authenticate Docker to Azure Container Registry
-      # ------------------------------------------------------------
+      # ============================================================
+      # 11. Authenticate Docker to ACR
+      # ============================================================
       - name: Login to Azure Container Registry
         shell: bash
         run: |
           set -euo pipefail
-          az acr login --name "$ACR_NAME"
 
-      # ------------------------------------------------------------
-      # 12. Build frontend with deployed API URL
-      # ------------------------------------------------------------
+          az acr login \
+            --name "$ACR_NAME"
+
+      # ============================================================
+      # 12. Build and push frontend
+      # ============================================================
       - name: Build and push frontend
+        id: frontend_image
         shell: bash
         run: |
           set -euo pipefail
 
           image="$ACR_NAME.azurecr.io/phase7-weather-ui:${DEPLOY_SHA}"
 
-          echo "Building frontend with API:"
+          echo "Building frontend with API URL:"
           echo "${{ steps.api.outputs.url }}"
 
           docker build \
-            --build-arg "VITE_API_BASE_URL=${{ steps.api.outputs.url }}" \
+            --build-arg \
+            "VITE_API_BASE_URL=${{ steps.api.outputs.url }}" \
             -t "$image" \
             frontend
 
           docker push "$image"
 
-          echo "UI_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 13. Deploy frontend
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Deploy frontend
         uses: azure/container-apps-deploy-action@v1
         with:
@@ -286,14 +374,14 @@ jobs:
           containerAppEnvironment: ${{ env.CONTAINERAPPS_ENV }}
           resourceGroup: ${{ env.RESOURCE_GROUP }}
 
-          imageToDeploy: ${{ env.UI_IMAGE }}
+          imageToDeploy: ${{ steps.frontend_image.outputs.image }}
 
           targetPort: 8080
           ingress: external
 
-      # ------------------------------------------------------------
-      # 14. Get frontend URL
-      # ------------------------------------------------------------
+      # ============================================================
+      # 14. Resolve frontend URL
+      # ============================================================
       - name: Resolve frontend URL
         id: frontend
         shell: bash
@@ -306,19 +394,28 @@ jobs:
             --query properties.configuration.ingress.fqdn \
             -o tsv)
 
-          echo "Frontend FQDN: $ui_fqdn"
+          if [ -z "$ui_fqdn" ]; then
+            echo "ERROR: frontend FQDN could not be resolved."
+            exit 1
+          fi
+
+          echo "Frontend FQDN:"
+          echo "$ui_fqdn"
 
           echo "url=https://$ui_fqdn" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # 15. Configure backend CORS and single-replica EMA state
-      # ------------------------------------------------------------
+      # ============================================================
+      # 15. Configure CORS and preserve EMA temporal state
+      # ============================================================
       - name: Configure API runtime and single-replica EMA state
         shell: bash
         run: |
           set -euo pipefail
 
           UI_URL="${{ steps.frontend.outputs.url }}"
+
+          echo "Configuring API CORS for:"
+          echo "$UI_URL"
 
           az containerapp update \
             --name "$API_APP" \
@@ -333,11 +430,12 @@ jobs:
               SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
               "CORS_ORIGINS=$UI_URL" \
             --min-replicas 1 \
-            --max-replicas 1
+            --max-replicas 1 \
+            --output none
 
-      # ------------------------------------------------------------
-      # 16. Final API readiness test
-      # ------------------------------------------------------------
+      # ============================================================
+      # 16. Final model readiness test
+      # ============================================================
       - name: Final API readiness test
         shell: bash
         run: |
@@ -345,7 +443,9 @@ jobs:
 
           API_URL="${{ steps.api.outputs.url }}"
 
-          for i in {1..30}; do
+          echo "Waiting for weather and segmentation models..."
+
+          for i in {1..60}; do
             if curl \
               --fail \
               --silent \
@@ -357,16 +457,16 @@ jobs:
               exit 0
             fi
 
-            echo "Waiting for models to become ready ($i/30)..."
+            echo "Waiting for models ($i/60)..."
             sleep 10
           done
 
-          echo "API never became ready."
+          echo "ERROR: API never became ready."
           exit 1
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 17. Frontend smoke test
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Frontend smoke test
         shell: bash
         run: |
@@ -383,9 +483,9 @@ jobs:
 
           echo "Frontend reachable."
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 18. Deployment summary
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Deployment summary
         shell: bash
         run: |
@@ -402,5 +502,5 @@ jobs:
             echo "$DEPLOY_SHA"
             echo ""
             echo "### Deployment"
-            echo "✅ Azure Container Apps deployment completed"
+            echo "Azure Container Apps deployment completed."
           } >> "$GITHUB_STEP_SUMMARY"
