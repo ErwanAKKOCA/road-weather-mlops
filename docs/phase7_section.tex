@@ -1,0 +1,123 @@
+% Phase VII section -- insert after Phase VI.
+% Requires: \usepackage{amsmath}, \usepackage{booktabs}, \usepackage{tabularx},
+%           \usepackage{float}, \usepackage{hyperref}
+
+\section{Phase VII: research application, reproducibility, and deployment}
+\label{sec:phase7}
+
+\subsection{Objective and scientific boundary}
+
+Phase VII converts the locked Phase VI experiment into an executable research
+demonstrator. It does not train, tune, or select another predictive model. Its purpose is
+to verify that the selected computer-vision pipeline can be exposed through a documented
+API, consumed by a web interface, tested automatically, packaged reproducibly, and prepared
+for cloud deployment. This separation prevents application engineering from reopening the
+scientific model-selection protocol.
+
+The deployed contract is the Phase VI configuration selected on Scene18 before the one-time
+Scene20 evaluation: a frozen DINOv2 ViT-S/14 representation, a multinomial logistic probe on
+the semantic-sky region, and causal exponential moving-average smoothing with
+$\alpha=0.6$. The output classes are \texttt{clone}, \texttt{fog}, and \texttt{rain}.
+Because the regional input relies on the Virtual KITTI 2 ground-truth colour mask, the
+application is explicitly presented as a synthetic-data research demonstrator rather than
+as a validated real-road weather or safety system.
+
+\subsection{System architecture}
+
+The system separates inference, presentation, automation, and deployment. A FastAPI
+backend validates the uploaded RGB frame and its corresponding semantic mask, reconstructs
+the semantic-sky image used in Phase VI, extracts the frozen DINOv2 embedding, applies the
+serialized logistic-regression model, and updates a causal EMA state identified by the
+sequence identifier. A React and TypeScript interface uploads ordered frames and displays
+raw and temporally smoothed probabilities, confidence, entropy, abstention status, and
+latency.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Phase VII application components.}
+\label{tab:phase7_components}
+\begin{tabularx}{\textwidth}{p{3.2cm}p{3.0cm}X}
+\toprule
+Component & Technology & Role\\
+\midrule
+Inference service & FastAPI, Python & Typed HTTP interface, input validation, DINOv2 inference, probability output, and sequence-state management\\
+Web interface & React, TypeScript, Vite & Upload of RGB--mask pairs and interactive display of temporal predictions\\
+Packaging & Docker, Docker Compose & Reproducible API and interface environments for local execution\\
+Verification & pytest, Ruff, TypeScript compiler & Unit, endpoint, style, and production-build checks\\
+Automation & GitHub Actions & Continuous integration and immutable image deployment using the Git commit SHA\\
+Cloud target & Azure Container Apps, ACR & Managed container revisions, ingress, health probes, logs, and operational metrics\\
+Artifact source & Google Cloud Storage & Retrieval of the checksummed canonical Phase VI release before the API image is built\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Inference API and temporal state}
+
+For frame $t$ of sequence $s$, the locked classifier returns a probability vector
+$\mathbf{p}_{s,t}$. The API applies exactly the Phase VI recursion
+
+\begin{equation}
+\widetilde{\mathbf{p}}_{s,t}=
+\begin{cases}
+\mathbf{p}_{s,t}, & t=0,\\
+0.6\,\mathbf{p}_{s,t}+0.4\,\widetilde{\mathbf{p}}_{s,t-1}, & t>0.
+\end{cases}
+\end{equation}
+
+State is isolated by sequence identifier and can be reset explicitly. It is bounded by a
+maximum number of sequences and an inactivity timeout. The response reports the predicted
+class, smoothed confidence, entropy, raw and smoothed probability vectors, frame index, and
+measured inference time. An optional confidence threshold supports selective prediction:
+frames below the threshold are flagged as abstentions rather than silently treated as
+reliable decisions.
+
+The service exposes separate liveness and readiness endpoints. Liveness confirms that the
+API process responds, whereas readiness confirms that the Phase VI artifacts and DINOv2
+model have loaded successfully. If the canonical release manifest is available, the model
+and region-definition files are checked against their SHA-256 hashes before serving
+predictions.
+
+\subsection{Automated verification and continuous integration}
+
+Backend tests verify that EMA is causal, sequence-local, resettable, and equal to the
+specified recursion. Endpoint tests verify health reporting, model metadata, valid
+multipart inference, temporal updates, and rejection of invalid image payloads. The
+continuous-integration workflow runs these tests and Ruff static checks with Python 3.12,
+then installs and compiles the React/TypeScript production bundle with Node.js 24.
+
+A deterministic mock engine is included only for application smoke tests when the private
+Phase VI artifacts are unavailable. It is separated through the \texttt{MODEL\_MODE}
+configuration and must not be used to report scientific performance. All thesis metrics
+remain those of the locked Phase VI release.
+
+\subsection{Containerisation and cloud-deployment design}
+
+Docker Compose connects the API and interface locally. For the cloud workflow, GitHub
+Actions authenticates to Google Cloud Storage, downloads the locked Phase VI archive,
+verifies the required artifact names, builds images tagged with the immutable commit SHA,
+and deploys two revisions to Azure Container Apps through Azure Container Registry. The
+frontend is built with the deployed API URL, and the API permits only the resulting frontend
+origin.
+
+The application provides Prometheus-format request and latency metrics and emits structured
+container logs. Recommended monitoring covers error ratio, readiness failures, restart
+loops, p95 inference latency, abstention rate, class-frequency drift, and confidence drift.
+Uploaded images are processed in memory and are not persisted by the application.
+
+The current EMA store is process-local. Consequently, the demonstrator is deliberately
+limited to one API replica so that consecutive frames of a sequence cannot be routed to
+different states. Production horizontal scaling would require a shared state store or a
+stateless protocol that carries temporal state between requests.
+
+\subsection{Outcome and limitations}
+
+Phase VII demonstrates the engineering path from a locked notebook experiment to a typed,
+testable, containerised application while maintaining the model identity and scientific
+limitations established in Phase VI. It adds no evidence that the very high Virtual KITTI 2
+Scene20 score transfers to real traffic. The strongest remaining limitation is the oracle
+semantic-sky mask. Replacing it with predicted segmentation, measuring end-to-end latency,
+and evaluating independent real adverse-weather videos are prerequisites for any claim of
+operational generalisation. An actual Azure production deployment additionally depends on
+user-controlled cloud identities and is not claimed solely from the presence of deployment
+configuration files.

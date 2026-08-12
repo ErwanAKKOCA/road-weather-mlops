@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: ./backend
+    environment:
+      MODEL_MODE: ${MODEL_MODE:-phase6}
+      ARTIFACT_DIR: /artifacts
+      SEGMENTATION_ENABLED: ${SEGMENTATION_ENABLED:-true}
+      SEGMENTATION_MODEL_DIR: /artifacts/mask2former_kitti_best
+      SEGMENTATION_DEVICE: ${SEGMENTATION_DEVICE:-auto}
+      EMA_ALPHA: "0.6"
+      DEFAULT_ABSTENTION_THRESHOLD: "0.90"
+      LOGGING_ENABLED: "true"
+      LOG_PATH: /tmp/road-weather-lab/inference.jsonl
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+    volumes:
+      - ./backend/artifacts:/artifacts:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped

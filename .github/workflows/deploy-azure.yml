@@ -1,0 +1,149 @@
+name: Deploy Azure Container Apps
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+  API_APP: ${{ vars.AZURE_API_APP_NAME }}
+  UI_APP: ${{ vars.AZURE_UI_APP_NAME }}
+  CONTAINERAPPS_ENV: ${{ vars.AZURE_CONTAINERAPPS_ENV }}
+  PHASE6_RELEASE: gs://thesis_weather_storage/phase6/releases/phase6_vkitti2_temporal_v4_1_release.tar.gz
+  PHASE7_MASK2FORMER_RELEASE: gs://thesis_weather_storage/phase7/releases/mask2former_kitti_v1_release.tar.gz
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Authenticate to Google Cloud for the locked Phase VI release
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Materialize checksummed Phase VI artifacts
+        run: |
+          gcloud storage cp "$PHASE6_RELEASE" /tmp/phase6-release.tar.gz
+          tar -xzf /tmp/phase6-release.tar.gz -C backend/artifacts
+          test -f backend/artifacts/dinov2_logistic_semantic_sky_v3_1.joblib
+          test -f backend/artifacts/region_definitions_v3_1.json
+          python - <<'PY' >> "$GITHUB_ENV"
+          import json
+          from pathlib import Path
+          versions = json.loads(Path("backend/artifacts/environment_v4_1.json").read_text())
+          print(f"PHASE6_SKLEARN_VERSION={versions['scikit_learn']}")
+          print(f"PHASE6_TIMM_VERSION={versions['timm']}")
+          print(f"PHASE6_TORCH_VERSION={versions['torch'].split('+')[0]}")
+          PY
+      - name: Materialize checksummed Mask2Former artifacts
+        run: |
+          gcloud storage cp \
+            "$PHASE7_MASK2FORMER_RELEASE" \
+            /tmp/mask2former-release.tar.gz
+
+          tar -xzf \
+            /tmp/mask2former-release.tar.gz \
+            -C backend/artifacts
+
+          test -f backend/artifacts/mask2former_kitti_best/model.safetensors
+          test -f backend/artifacts/mask2former_kitti_best/config.json
+          test -f backend/artifacts/mask2former_kitti_best/preprocessor_config.json
+          test -f backend/artifacts/mask2former_kitti_best/release_manifest.json
+      - name: Validate deployable artifact checksums
+        working-directory: backend
+        run: python scripts/validate_release.py --artifacts artifacts
+
+      - name: Authenticate to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and deploy API
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSourcePath: ${{ github.workspace }}/backend
+          acrName: ${{ env.ACR_NAME }}
+          containerAppName: ${{ env.API_APP }}
+          containerAppEnvironment: ${{ env.CONTAINERAPPS_ENV }}
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          imageToBuild: ${{ env.ACR_NAME }}.azurecr.io/phase7-weather-api:${{ env.DEPLOY_SHA }}
+          buildArguments: SCIKIT_LEARN_VERSION=${{ env.PHASE6_SKLEARN_VERSION }} TIMM_VERSION=${{ env.PHASE6_TIMM_VERSION }} TORCH_VERSION=${{ env.PHASE6_TORCH_VERSION }}
+          targetPort: 8000
+          ingress: external
+          environmentVariables: >-
+            MODEL_MODE=phase6
+            ARTIFACT_DIR=/artifacts
+            EMA_ALPHA=0.6
+            DEFAULT_ABSTENTION_THRESHOLD=0.90
+            LOGGING_ENABLED=true
+            SEGMENTATION_ENABLED=true
+            SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best
+
+      - name: Resolve API URL
+        id: api
+        shell: bash
+        run: |
+          fqdn=$(az containerapp show --name "$API_APP" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          echo "url=https://$fqdn" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push frontend
+        shell: bash
+        run: |
+          az acr login --name "$ACR_NAME"
+          image="$ACR_NAME.azurecr.io/phase7-weather-ui:${DEPLOY_SHA}"
+          docker build --build-arg "VITE_API_BASE_URL=${{ steps.api.outputs.url }}" -t "$image" frontend
+          docker push "$image"
+          echo "UI_IMAGE=$image" >> "$GITHUB_ENV"
+
+      - name: Deploy frontend
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          acrName: ${{ env.ACR_NAME }}
+          containerAppName: ${{ env.UI_APP }}
+          containerAppEnvironment: ${{ env.CONTAINERAPPS_ENV }}
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          imageToDeploy: ${{ env.UI_IMAGE }}
+          targetPort: 8080
+          ingress: external
+
+      - name: Configure API runtime and single-replica EMA state
+        shell: bash
+        run: |
+          ui_fqdn=$(az containerapp show \
+            --name "$UI_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)
+
+          az containerapp update \
+            --name "$API_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --set-env-vars \
+              MODEL_MODE=phase6 \
+              ARTIFACT_DIR=/artifacts \
+              EMA_ALPHA=0.6 \
+              DEFAULT_ABSTENTION_THRESHOLD=0.90 \
+              LOGGING_ENABLED=true \
+              SEGMENTATION_ENABLED=true \
+              SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
+              "CORS_ORIGINS=https://$ui_fqdn" \
+            --min-replicas 1 \
+            --max-replicas 1
