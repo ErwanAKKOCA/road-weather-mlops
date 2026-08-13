@@ -254,6 +254,7 @@ jobs:
             --build-arg "SCIKIT_LEARN_VERSION=${{ steps.phase6.outputs.sklearn_version }}" \
             --build-arg "TIMM_VERSION=${{ steps.phase6.outputs.timm_version }}" \
             --build-arg "TORCH_VERSION=${{ steps.phase6.outputs.torch_version }}" \
+            --build-arg "TORCHVISION_VERSION=0.26.0" \
             -t "$image" \
             backend
 
