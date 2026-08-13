@@ -14,6 +14,8 @@ env:
   UI_APP: ${{ vars.AZURE_UI_APP_NAME }}
   CONTAINERAPPS_ENV: ${{ vars.AZURE_CONTAINERAPPS_ENV }}
 
+  ACR_PULL_IDENTITY: road-weather-acr-pull
+
   PHASE6_RELEASE: gs://thesis_weather_storage/phase6/releases/phase6_vkitti2_temporal_v4_1_release.tar.gz
   PHASE7_MASK2FORMER_RELEASE: gs://thesis_weather_storage/phase7/releases/mask2former_kitti_v1_release.tar.gz
 
@@ -62,7 +64,6 @@ jobs:
           mkdir -p /tmp/phase6-extracted
 
           echo "Downloading Phase VI release..."
-
           gcloud storage cp \
             "$PHASE6_RELEASE" \
             /tmp/phase6-release.tar.gz
@@ -71,7 +72,6 @@ jobs:
           tar -tzf /tmp/phase6-release.tar.gz | sed -n '1,100p'
 
           echo "Extracting Phase VI release..."
-
           tar -xzf \
             /tmp/phase6-release.tar.gz \
             -C /tmp/phase6-extracted
@@ -99,7 +99,6 @@ jobs:
           cp -a "$PHASE6_ROOT"/. backend/artifacts/
 
           echo "Checking required Phase VI files..."
-
           required_files=(
             "dinov2_logistic_semantic_sky_v3_1.joblib"
             "region_definitions_v3_1.json"
@@ -112,12 +111,10 @@ jobs:
               echo "ERROR: missing backend/artifacts/$file"
               exit 1
             fi
-
             echo "OK: backend/artifacts/$file"
           done
 
           echo "Reading locked dependency versions..."
-
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           from pathlib import Path
@@ -126,20 +123,9 @@ jobs:
               Path("backend/artifacts/environment_v4_1.json").read_text()
           )
 
-          print(
-              f"sklearn_version="
-              f"{versions['scikit_learn']}"
-          )
-
-          print(
-              f"timm_version="
-              f"{versions['timm']}"
-          )
-
-          print(
-              f"torch_version="
-              f"{versions['torch'].split('+')[0]}"
-          )
+          print(f"sklearn_version={versions['scikit_learn']}")
+          print(f"timm_version={versions['timm']}")
+          print(f"torch_version={versions['torch'].split('+')[0]}")
           PY
 
       # ============================================================
@@ -153,19 +139,16 @@ jobs:
           mkdir -p backend/artifacts
 
           echo "Downloading Mask2Former release..."
-
           gcloud storage cp \
             "$PHASE7_MASK2FORMER_RELEASE" \
             /tmp/mask2former-release.tar.gz
 
           echo "Extracting Mask2Former release..."
-
           tar -xzf \
             /tmp/mask2former-release.tar.gz \
             -C backend/artifacts
 
           echo "Checking Mask2Former files..."
-
           required_files=(
             "model.safetensors"
             "config.json"
@@ -192,9 +175,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          python scripts/validate_release.py \
-            --artifacts artifacts
+          python scripts/validate_release.py --artifacts artifacts
 
       # ============================================================
       # 6. Authenticate GitHub -> Azure using OIDC
@@ -207,21 +188,17 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       # ============================================================
-      # 7. Verify Azure infrastructure
+      # 7. Verify Azure infrastructure and ACR pull identity
       # ============================================================
       - name: Verify Azure deployment context
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Resource group:"
-          echo "$RESOURCE_GROUP"
-
-          echo "Azure Container Registry:"
-          echo "$ACR_NAME"
-
-          echo "Container Apps environment:"
-          echo "$CONTAINERAPPS_ENV"
+          echo "Resource group: $RESOURCE_GROUP"
+          echo "ACR: $ACR_NAME"
+          echo "Container Apps environment: $CONTAINERAPPS_ENV"
+          echo "ACR pull identity: $ACR_PULL_IDENTITY"
 
           az group show \
             --name "$RESOURCE_GROUP" \
@@ -234,6 +211,11 @@ jobs:
 
           az containerapp env show \
             --name "$CONTAINERAPPS_ENV" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output none
+
+          az identity show \
+            --name "$ACR_PULL_IDENTITY" \
             --resource-group "$RESOURCE_GROUP" \
             --output none
 
@@ -263,7 +245,9 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 9. Deploy FastAPI backend with managed ACR pull identity
+      # 9. Deploy FastAPI backend
+      #    - delete and recreate an old resource stuck in Failed
+      #    - otherwise update an existing healthy resource
       # ============================================================
       - name: Deploy API
         shell: bash
@@ -271,18 +255,81 @@ jobs:
           set -euo pipefail
 
           PULL_ID=$(az identity show \
-            --name road-weather-acr-pull \
+            --name "$ACR_PULL_IDENTITY" \
             --resource-group "$RESOURCE_GROUP" \
             --query id \
             -o tsv)
 
           IMAGE="${{ steps.api_image.outputs.image }}"
 
-          if az containerapp show \
+          STATE=$(az containerapp show \
             --name "$API_APP" \
             --resource-group "$RESOURCE_GROUP" \
-            >/dev/null 2>&1; then
+            --query properties.provisioningState \
+            -o tsv 2>/dev/null || true)
 
+          if [ -z "$STATE" ]; then
+            STATE="NotFound"
+          fi
+
+          echo "Current API provisioning state: $STATE"
+
+          if [ "$STATE" = "Failed" ]; then
+            echo "Deleting failed API resource..."
+
+            az containerapp delete \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --yes
+
+            deleted="false"
+
+            for i in {1..30}; do
+              if ! az containerapp show \
+                --name "$API_APP" \
+                --resource-group "$RESOURCE_GROUP" \
+                >/dev/null 2>&1; then
+                deleted="true"
+                break
+              fi
+
+              echo "Waiting for failed API deletion ($i/30)..."
+              sleep 5
+            done
+
+            if [ "$deleted" != "true" ]; then
+              echo "ERROR: failed API resource was not deleted in time."
+              exit 1
+            fi
+
+            STATE="NotFound"
+          fi
+
+          if [ "$STATE" = "NotFound" ]; then
+            echo "Creating API..."
+
+            az containerapp create \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINERAPPS_ENV" \
+              --image "$IMAGE" \
+              --target-port 8000 \
+              --ingress external \
+              --user-assigned "$PULL_ID" \
+              --registry-identity "$PULL_ID" \
+              --registry-server "$ACR_NAME.azurecr.io" \
+              --env-vars \
+                MODEL_MODE=phase6 \
+                ARTIFACT_DIR=/artifacts \
+                EMA_ALPHA=0.6 \
+                DEFAULT_ABSTENTION_THRESHOLD=0.90 \
+                LOGGING_ENABLED=true \
+                SEGMENTATION_ENABLED=true \
+                SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
+              --min-replicas 1 \
+              --max-replicas 1 \
+              --output none
+          else
             echo "Updating existing API..."
 
             az containerapp identity assign \
@@ -310,6 +357,8 @@ jobs:
                 LOGGING_ENABLED=true \
                 SEGMENTATION_ENABLED=true \
                 SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
+              --min-replicas 1 \
+              --max-replicas 1 \
               --output none
 
             az containerapp ingress enable \
@@ -318,30 +367,6 @@ jobs:
               --type external \
               --target-port 8000 \
               --transport auto \
-              --output none
-
-          else
-
-            echo "Creating API..."
-
-            az containerapp create \
-              --name "$API_APP" \
-              --resource-group "$RESOURCE_GROUP" \
-              --environment "$CONTAINERAPPS_ENV" \
-              --image "$IMAGE" \
-              --target-port 8000 \
-              --ingress external \
-              --user-assigned "$PULL_ID" \
-              --registry-identity "$PULL_ID" \
-              --registry-server "$ACR_NAME.azurecr.io" \
-              --env-vars \
-                MODEL_MODE=phase6 \
-                ARTIFACT_DIR=/artifacts \
-                EMA_ALPHA=0.6 \
-                DEFAULT_ABSTENTION_THRESHOLD=0.90 \
-                LOGGING_ENABLED=true \
-                SEGMENTATION_ENABLED=true \
-                SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
               --output none
           fi
 
@@ -365,9 +390,7 @@ jobs:
             exit 1
           fi
 
-          echo "API FQDN:"
-          echo "$fqdn"
-
+          echo "API FQDN: $fqdn"
           echo "url=https://$fqdn" >> "$GITHUB_OUTPUT"
 
       # ============================================================
@@ -380,8 +403,7 @@ jobs:
 
           API_URL="${{ steps.api.outputs.url }}"
 
-          echo "Waiting for API:"
-          echo "$API_URL"
+          echo "Waiting for API: $API_URL"
 
           for i in {1..30}; do
             if curl \
@@ -428,7 +450,8 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 13. Deploy frontend with managed ACR pull identity
+      # 13. Deploy frontend
+      #    - same Failed-state recovery strategy as the API
       # ============================================================
       - name: Deploy frontend
         shell: bash
@@ -436,18 +459,71 @@ jobs:
           set -euo pipefail
 
           PULL_ID=$(az identity show \
-            --name road-weather-acr-pull \
+            --name "$ACR_PULL_IDENTITY" \
             --resource-group "$RESOURCE_GROUP" \
             --query id \
             -o tsv)
 
           IMAGE="${{ steps.frontend_image.outputs.image }}"
 
-          if az containerapp show \
+          STATE=$(az containerapp show \
             --name "$UI_APP" \
             --resource-group "$RESOURCE_GROUP" \
-            >/dev/null 2>&1; then
+            --query properties.provisioningState \
+            -o tsv 2>/dev/null || true)
 
+          if [ -z "$STATE" ]; then
+            STATE="NotFound"
+          fi
+
+          echo "Current frontend provisioning state: $STATE"
+
+          if [ "$STATE" = "Failed" ]; then
+            echo "Deleting failed frontend resource..."
+
+            az containerapp delete \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --yes
+
+            deleted="false"
+
+            for i in {1..30}; do
+              if ! az containerapp show \
+                --name "$UI_APP" \
+                --resource-group "$RESOURCE_GROUP" \
+                >/dev/null 2>&1; then
+                deleted="true"
+                break
+              fi
+
+              echo "Waiting for failed frontend deletion ($i/30)..."
+              sleep 5
+            done
+
+            if [ "$deleted" != "true" ]; then
+              echo "ERROR: failed frontend resource was not deleted in time."
+              exit 1
+            fi
+
+            STATE="NotFound"
+          fi
+
+          if [ "$STATE" = "NotFound" ]; then
+            echo "Creating frontend..."
+
+            az containerapp create \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINERAPPS_ENV" \
+              --image "$IMAGE" \
+              --target-port 8080 \
+              --ingress external \
+              --user-assigned "$PULL_ID" \
+              --registry-identity "$PULL_ID" \
+              --registry-server "$ACR_NAME.azurecr.io" \
+              --output none
+          else
             echo "Updating existing frontend..."
 
             az containerapp identity assign \
@@ -476,23 +552,8 @@ jobs:
               --target-port 8080 \
               --transport auto \
               --output none
-
-          else
-
-            echo "Creating frontend..."
-
-            az containerapp create \
-              --name "$UI_APP" \
-              --resource-group "$RESOURCE_GROUP" \
-              --environment "$CONTAINERAPPS_ENV" \
-              --image "$IMAGE" \
-              --target-port 8080 \
-              --ingress external \
-              --user-assigned "$PULL_ID" \
-              --registry-identity "$PULL_ID" \
-              --registry-server "$ACR_NAME.azurecr.io" \
-              --output none
           fi
+
       # ============================================================
       # 14. Resolve frontend URL
       # ============================================================
@@ -513,9 +574,7 @@ jobs:
             exit 1
           fi
 
-          echo "Frontend FQDN:"
-          echo "$ui_fqdn"
-
+          echo "Frontend FQDN: $ui_fqdn"
           echo "url=https://$ui_fqdn" >> "$GITHUB_OUTPUT"
 
       # ============================================================
