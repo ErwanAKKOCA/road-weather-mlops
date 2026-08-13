@@ -238,40 +238,114 @@ jobs:
             --output none
 
       # ============================================================
-      # 8. Build, push and deploy FastAPI backend
+      # 8. Build and push FastAPI backend image
       # ============================================================
-      - name: Build and deploy API
-        uses: azure/container-apps-deploy-action@v1
-        with:
-          appSourcePath: ${{ github.workspace }}/backend
-          dockerfilePath: Dockerfile
+      - name: Build and push API image
+        id: api_image
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          acrName: ${{ env.ACR_NAME }}
+          az acr login --name "$ACR_NAME"
 
-          containerAppName: ${{ env.API_APP }}
-          containerAppEnvironment: ${{ env.CONTAINERAPPS_ENV }}
-          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          image="$ACR_NAME.azurecr.io/phase7-weather-api:${DEPLOY_SHA}"
 
-          imageToBuild: >-
-            ${{ env.ACR_NAME }}.azurecr.io/phase7-weather-api:${{ env.DEPLOY_SHA }}
+          docker build \
+            --build-arg "SCIKIT_LEARN_VERSION=${{ steps.phase6.outputs.sklearn_version }}" \
+            --build-arg "TIMM_VERSION=${{ steps.phase6.outputs.timm_version }}" \
+            --build-arg "TORCH_VERSION=${{ steps.phase6.outputs.torch_version }}" \
+            -t "$image" \
+            backend
 
-          buildArguments: |
-            "SCIKIT_LEARN_VERSION=${{ steps.phase6.outputs.sklearn_version }}" "TIMM_VERSION=${{ steps.phase6.outputs.timm_version }}" "TORCH_VERSION=${{ steps.phase6.outputs.torch_version }}"
+          docker push "$image"
 
-          targetPort: 8000
-          ingress: external
-
-          environmentVariables: >-
-            MODEL_MODE=phase6
-            ARTIFACT_DIR=/artifacts
-            EMA_ALPHA=0.6
-            DEFAULT_ABSTENTION_THRESHOLD=0.90
-            LOGGING_ENABLED=true
-            SEGMENTATION_ENABLED=true
-            SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 9. Resolve backend public URL
+      # 9. Deploy FastAPI backend with managed ACR pull identity
+      # ============================================================
+      - name: Deploy API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PULL_ID=$(az identity show \
+            --name road-weather-acr-pull \
+            --resource-group "$RESOURCE_GROUP" \
+            --query id \
+            -o tsv)
+
+          IMAGE="${{ steps.api_image.outputs.image }}"
+
+          if az containerapp show \
+            --name "$API_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            >/dev/null 2>&1; then
+
+            echo "Updating existing API..."
+
+            az containerapp identity assign \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --user-assigned "$PULL_ID" \
+              --output none
+
+            az containerapp registry set \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "$ACR_NAME.azurecr.io" \
+              --identity "$PULL_ID" \
+              --output none
+
+            az containerapp update \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "$IMAGE" \
+              --set-env-vars \
+                MODEL_MODE=phase6 \
+                ARTIFACT_DIR=/artifacts \
+                EMA_ALPHA=0.6 \
+                DEFAULT_ABSTENTION_THRESHOLD=0.90 \
+                LOGGING_ENABLED=true \
+                SEGMENTATION_ENABLED=true \
+                SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
+              --output none
+
+            az containerapp ingress enable \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --type external \
+              --target-port 8000 \
+              --transport auto \
+              --output none
+
+          else
+
+            echo "Creating API..."
+
+            az containerapp create \
+              --name "$API_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINERAPPS_ENV" \
+              --image "$IMAGE" \
+              --target-port 8000 \
+              --ingress external \
+              --user-assigned "$PULL_ID" \
+              --registry-identity "$PULL_ID" \
+              --registry-server "$ACR_NAME.azurecr.io" \
+              --env-vars \
+                MODEL_MODE=phase6 \
+                ARTIFACT_DIR=/artifacts \
+                EMA_ALPHA=0.6 \
+                DEFAULT_ABSTENTION_THRESHOLD=0.90 \
+                LOGGING_ENABLED=true \
+                SEGMENTATION_ENABLED=true \
+                SEGMENTATION_MODEL_DIR=/artifacts/mask2former_kitti_best \
+              --output none
+          fi
+
+      # ============================================================
+      # 10. Resolve backend public URL
       # ============================================================
       - name: Resolve API URL
         id: api
@@ -296,7 +370,7 @@ jobs:
           echo "url=https://$fqdn" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 10. Smoke-test backend
+      # 11. Smoke-test backend
       # ============================================================
       - name: Smoke-test deployed API
         shell: bash
@@ -328,17 +402,6 @@ jobs:
           exit 1
 
       # ============================================================
-      # 11. Authenticate Docker to ACR
-      # ============================================================
-      - name: Login to Azure Container Registry
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          az acr login \
-            --name "$ACR_NAME"
-
-      # ============================================================
       # 12. Build and push frontend
       # ============================================================
       - name: Build and push frontend
@@ -347,14 +410,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          az acr login --name "$ACR_NAME"
+
           image="$ACR_NAME.azurecr.io/phase7-weather-ui:${DEPLOY_SHA}"
 
           echo "Building frontend with API URL:"
           echo "${{ steps.api.outputs.url }}"
 
           docker build \
-            --build-arg \
-            "VITE_API_BASE_URL=${{ steps.api.outputs.url }}" \
+            --build-arg "VITE_API_BASE_URL=${{ steps.api.outputs.url }}" \
             -t "$image" \
             frontend
 
@@ -363,22 +427,71 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 13. Deploy frontend
+      # 13. Deploy frontend with managed ACR pull identity
       # ============================================================
       - name: Deploy frontend
-        uses: azure/container-apps-deploy-action@v1
-        with:
-          acrName: ${{ env.ACR_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          containerAppName: ${{ env.UI_APP }}
-          containerAppEnvironment: ${{ env.CONTAINERAPPS_ENV }}
-          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          PULL_ID=$(az identity show \
+            --name road-weather-acr-pull \
+            --resource-group "$RESOURCE_GROUP" \
+            --query id \
+            -o tsv)
 
-          imageToDeploy: ${{ steps.frontend_image.outputs.image }}
+          IMAGE="${{ steps.frontend_image.outputs.image }}"
 
-          targetPort: 8080
-          ingress: external
+          if az containerapp show \
+            --name "$UI_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            >/dev/null 2>&1; then
 
+            echo "Updating existing frontend..."
+
+            az containerapp identity assign \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --user-assigned "$PULL_ID" \
+              --output none
+
+            az containerapp registry set \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "$ACR_NAME.azurecr.io" \
+              --identity "$PULL_ID" \
+              --output none
+
+            az containerapp update \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "$IMAGE" \
+              --output none
+
+            az containerapp ingress enable \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --type external \
+              --target-port 8080 \
+              --transport auto \
+              --output none
+
+          else
+
+            echo "Creating frontend..."
+
+            az containerapp create \
+              --name "$UI_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINERAPPS_ENV" \
+              --image "$IMAGE" \
+              --target-port 8080 \
+              --ingress external \
+              --user-assigned "$PULL_ID" \
+              --registry-identity "$PULL_ID" \
+              --registry-server "$ACR_NAME.azurecr.io" \
+              --output none
+          fi
       # ============================================================
       # 14. Resolve frontend URL
       # ============================================================
